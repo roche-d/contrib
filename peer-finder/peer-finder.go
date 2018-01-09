@@ -38,23 +38,26 @@ const (
 )
 
 var (
-	onChange  = flag.String("on-change", "", "Script to run on change, must accept a new line separated list of peers via stdin.")
-	onStart   = flag.String("on-start", "", "Script to run on start, must accept a new line separated list of peers via stdin.")
-	svc       = flag.String("service", "", "Governing service responsible for the DNS records of the domain this pod is in.")
-	namespace = flag.String("ns", "", "The namespace this pod is running in. If unspecified, the POD_NAMESPACE env var is used.")
-	domain    = flag.String("domain", "", "The Cluster Domain which is used by the Cluster, if not set tries to determine it from /etc/resolv.conf file.")
+	onChange   = flag.String("on-change", "", "Script to run on change, must accept a new line separated list of peers via stdin.")
+	onStart    = flag.String("on-start", "", "Script to run on start, must accept a new line separated list of peers via stdin.")
+	svc        = flag.String("service", "", "Governing service responsible for the DNS records of the domain this pod is in.")
+	namespace  = flag.String("ns", "", "The namespace this pod is running in. If unspecified, the POD_NAMESPACE env var is used.")
+	domain     = flag.String("domain", "", "The Cluster Domain which is used by the Cluster, if not set tries to determine it from /etc/resolv.conf file.")
+	extDomains = flag.String("extdomain", "", "Comma-separated list of additional domains to probe (multi cluster peer finding).")
 )
 
-func lookup(svcName string) (sets.String, error) {
+func lookup(svcNames []string) (sets.String, error) {
 	endpoints := sets.NewString()
-	_, srvRecords, err := net.LookupSRV("", "", svcName)
-	if err != nil {
-		return endpoints, err
-	}
-	for _, srvRecord := range srvRecords {
-		// The SRV records ends in a "." for the root domain
-		ep := fmt.Sprintf("%v", srvRecord.Target[:len(srvRecord.Target)-1])
-		endpoints.Insert(ep)
+	for _, svcName := range svcNames {
+		_, srvRecords, err := net.LookupSRV("", "", svcName)
+		if err != nil {
+			return endpoints, err
+		}
+		for _, srvRecord := range srvRecords {
+			// The SRV records ends in a "." for the root domain
+			ep := fmt.Sprintf("%v", srvRecord.Target[:len(srvRecord.Target)-1])
+			endpoints.Insert(ep)
+		}
 	}
 	return endpoints, nil
 }
@@ -80,7 +83,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to get hostname: %s", err)
 	}
-	var domainName string
+	var domainNames = []string{""}
 
 	// If domain is not provided, try to get it from resolv.conf
 	if *domain == "" {
@@ -108,32 +111,52 @@ func main() {
 			if groupNames[k] == "goal" {
 				if ns == "" {
 					// Domain is complete if ns is empty
-					domainName = v
+					domainNames = []string{v}
 				} else {
 					// Need to convert svc.** into ns.svc.**
-					domainName = ns + "." + v
+					domainNames = []string{ns + "." + v}
 				}
 				break
 			}
 		}
-		log.Printf("Determined Domain to be %s", domainName)
+		log.Printf("Determined Domain to be %s", domainNames[0])
 
 	} else {
-		domainName = strings.Join([]string{ns, "svc", *domain}, ".")
+		domainNames = []string{strings.Join([]string{ns, "svc", *domain}, ".")}
 	}
 
-	if *svc == "" || domainName == "" || (*onChange == "" && *onStart == "") {
+	if *svc == "" || domainNames[0] == "" || (*onChange == "" && *onStart == "") {
 		log.Fatalf("Incomplete args, require -on-change and/or -on-start, -service and -ns or an env var for POD_NAMESPACE.")
 	}
 
-	myName := strings.Join([]string{hostname, *svc, domainName}, ".")
+	if *extDomains != "" {
+		for _, d := range strings.Split(*extDomains, ",") {
+			if d != "" {
+				if strings.HasSuffix(d, ".local") {
+					domainNames = append(domainNames, strings.Join([]string{ns, "svc", d}, "."))
+				} else {
+					domainNames = append(domainNames, strings.Join([]string{ns, "svc", d, "local"}, "."))
+				}
+			}
+		}
+	}
+	log.Printf("Following domains will be searched %v", domainNames)
+
+	myName := strings.Join([]string{hostname, *svc, domainNames[0]}, ".")
+
 	script := *onStart
 	if script == "" {
 		script = *onChange
 		log.Printf("No on-start supplied, on-change %v will be applied on start.", script)
 	}
+
+	var services []string
+	for _, domain := range domainNames {
+		services = append(services, strings.Join([]string{*svc, domain}, "."))
+	}
+
 	for newPeers, peers := sets.NewString(), sets.NewString(); script != ""; time.Sleep(pollPeriod) {
-		newPeers, err = lookup(*svc)
+		newPeers, err = lookup(services)
 		if err != nil {
 			log.Printf("%v", err)
 			continue
@@ -149,6 +172,7 @@ func main() {
 		peers = newPeers
 		script = *onChange
 	}
+
 	// TODO: Exit if there's no on-change?
 	log.Printf("Peer finder exiting")
 }
